@@ -1,0 +1,347 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # cosign keyless 签名需要 OIDC token
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: car-go
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux-amd64
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            platform: linux-arm64
+
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            platform: macos-amd64
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform: macos-arm64
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows-amd64
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            platform: windows-aarch64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Prepare binary
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          EXT=""
+          [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
+          SRC="target/${{ matrix.target }}/release/${BIN_NAME}${EXT}"
+          DEST="${BIN_NAME}-v${VERSION}-${{ matrix.platform }}${EXT}"
+          cp "$SRC" "$DEST"
+
+      - name: Strip binary (Linux/macOS)
+        if: matrix.os != 'windows-latest' && matrix.os != 'windows-11-arm'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          strip "${BIN_NAME}-v${VERSION}-${{ matrix.platform }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: ${{ env.BIN_NAME }}-v*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify package
+        run: cargo package --list
+
+      - name: Dry run publish
+        run: cargo publish --dry-run
+
+      - name: Publish to crates.io
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name "${BIN_NAME}-v*" -exec cp {} release/ \;
+          cd release && sha256sum * > checksums.txt
+
+      - name: Sign checksums
+        run: |
+          cosign sign-blob --yes \
+            release/checksums.txt \
+            --output-signature release/checksums.txt.sig \
+            --output-certificate release/checksums.txt.pem
+
+      # changelog 提取规则参考 AsterDrive：从 CHANGELOG.md 里 awk 出
+      # 当前版本段落（## [version] 到下一个 ## [ 之间），没有则回退
+      - name: Extract changelog
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          awk '/^## \['"${VERSION}"'\]/{flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+
+          if [ ! -s release_notes.md ]; then
+            echo "No changelog found for ${VERSION}, using fallback"
+            echo "## What's Changed" > release_notes.md
+            echo "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details." >> release_notes.md
+          fi
+
+          echo "--- Changelog for ${VERSION} ---"
+          cat release_notes.md
+
+      - name: Build release body
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          {
+            cat release_notes.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Download"
+            echo ""
+            echo "| Platform | File |"
+            echo "|----------|------|"
+            for f in release/${BIN_NAME}-v${VERSION}-*; do
+              name="$(basename "$f")"
+              platform="${name#${BIN_NAME}-v${VERSION}-}"
+              case "$platform" in
+                linux-amd64)       label="Linux x86_64" ;;
+                linux-arm64)       label="Linux ARM64" ;;
+                macos-amd64)       label="macOS x86_64" ;;
+                macos-arm64)       label="macOS ARM64" ;;
+                windows-amd64.exe) label="Windows x86_64" ;;
+                windows-aarch64.exe) label="Windows ARM64" ;;
+                *)                 label="$platform" ;;
+              esac
+              url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${name}"
+              echo "| ${label} | [${name}](${url}) |"
+            done
+            echo ""
+            echo "**Checksums**: [checksums.txt](https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/checksums.txt)"
+            echo ""
+            echo "### Verify signatures"
+            echo ""
+            echo "All release files are signed with [Sigstore cosign](https://docs.sigstore.dev/):"
+            echo ""
+            echo '```bash'
+            echo "wget https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/{checksums.txt,checksums.txt.sig,checksums.txt.pem}"
+            echo ""
+            echo 'cosign verify-blob checksums.txt \'
+            echo '  --signature checksums.txt.sig \'
+            echo '  --certificate checksums.txt.pem \'
+            echo '  --certificate-oidc-issuer https://token.actions.githubusercontent.com \'
+            echo "  --certificate-identity-regexp 'github.com/${{ github.repository }}'"
+            echo ""
+            echo "sha256sum -c checksums.txt"
+            echo '```'
+          } > release_body.md
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.BIN_NAME }} ${{ github.ref_name }}
+          body_path: release_body.md
+          files: release/*
+          draft: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          args=(--draft=false)
+          case "${GITHUB_REF_NAME}" in
+            *alpha*|*beta*|*rc*)
+              args+=(--prerelease)
+              ;;
+            *)
+              args+=(--latest)
+              ;;
+          esac
+          gh release edit "${GITHUB_REF_NAME}" "${args[@]}"
+
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets and calculate SHA256
+        id: sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          BIN=${{ env.BIN_NAME }}
+
+          for platform in macos-arm64 macos-amd64 linux-arm64 linux-amd64; do
+            gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" \
+              --pattern "${BIN}-v${VERSION}-${platform}" --output "${platform}"
+          done
+
+          echo "macos_arm64=$(sha256sum macos-arm64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "macos_amd64=$(sha256sum macos-amd64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "linux_arm64=$(sha256sum linux-arm64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "linux_amd64=$(sha256sum linux-amd64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew Formula
+        uses: actions/github-script@v7
+        with:
+          # 需要有 repo 权限的 PAT，存为 HOMEBREW_TAP_TOKEN；
+          # HOMEBREW_FORMULA_CLASS / PROJECT_DESCRIPTION / HOMEBREW_TAP_OWNER / HOMEBREW_TAP_REPO 走 repo variables
+          github-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          script: |
+            const version = '${{ github.ref_name }}'.replace(/^v/, '');
+            const bin = '${{ env.BIN_NAME }}';
+            const repo = '${{ github.repository }}';
+            const sha256 = {
+              macos_arm64: '${{ steps.sha256.outputs.macos_arm64 }}',
+              macos_amd64: '${{ steps.sha256.outputs.macos_amd64 }}',
+              linux_arm64: '${{ steps.sha256.outputs.linux_arm64 }}',
+              linux_amd64: '${{ steps.sha256.outputs.linux_amd64 }}'
+            };
+
+            const className = '${{ vars.HOMEBREW_FORMULA_CLASS }}';
+            const desc = '${{ vars.PROJECT_DESCRIPTION }}';
+            const tapOwner = '${{ vars.HOMEBREW_TAP_OWNER }}';
+            const tapRepo = '${{ vars.HOMEBREW_TAP_REPO }}';
+            const formulaPath = `Formula/${bin}.rb`;
+
+            const formula = `# typed: false
+            # frozen_string_literal: true
+
+            class ${className} < Formula
+              desc "${desc}"
+              homepage "https://github.com/${repo}"
+              version "${version}"
+              license "MIT"
+
+              on_macos do
+                on_arm do
+                  url "https://github.com/${repo}/releases/download/v#{version}/${bin}-v#{version}-macos-arm64"
+                  sha256 "${sha256.macos_arm64}"
+
+                  def install
+                    bin.install "${bin}-v#{version}-macos-arm64" => "${bin}"
+                  end
+                end
+
+                on_intel do
+                  url "https://github.com/${repo}/releases/download/v#{version}/${bin}-v#{version}-macos-amd64"
+                  sha256 "${sha256.macos_amd64}"
+
+                  def install
+                    bin.install "${bin}-v#{version}-macos-amd64" => "${bin}"
+                  end
+                end
+              end
+
+              on_linux do
+                on_arm do
+                  url "https://github.com/${repo}/releases/download/v#{version}/${bin}-v#{version}-linux-arm64"
+                  sha256 "${sha256.linux_arm64}"
+
+                  def install
+                    bin.install "${bin}-v#{version}-linux-arm64" => "${bin}"
+                  end
+                end
+
+                on_intel do
+                  url "https://github.com/${repo}/releases/download/v#{version}/${bin}-v#{version}-linux-amd64"
+                  sha256 "${sha256.linux_amd64}"
+
+                  def install
+                    bin.install "${bin}-v#{version}-linux-amd64" => "${bin}"
+                  end
+                end
+              end
+
+              test do
+                assert_match version.to_s, shell_output("#{bin}/${bin} --version")
+              end
+            end
+            `.split('\n').map(line => line.replace(/^            /, '')).join('\n');
+
+            let fileSha;
+            try {
+              const { data } = await github.rest.repos.getContent({
+                owner: tapOwner,
+                repo: tapRepo,
+                path: formulaPath
+              });
+              fileSha = data.sha;
+            } catch (e) {
+              fileSha = undefined;
+            }
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: tapOwner,
+              repo: tapRepo,
+              path: formulaPath,
+              message: `chore: bump ${bin} to v${version}`,
+              content: Buffer.from(formula).toString('base64'),
+              sha: fileSha
+            });

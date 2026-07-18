@@ -1,0 +1,27 @@
+name: Question
+description: Ask how to use car-go
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      value: |
+        - car-go version:
+        - Go version:
+        - OS:
+        - Command:
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked the README and searched existing issues
+          required: true

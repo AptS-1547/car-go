@@ -1,0 +1,25 @@
+[package]
+name = "car-go"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "MIT"
+description = "cargo-style output for the Go toolchain"
+authors = ["AptS-1547"]
+repository = "https://github.com/AptS-1547/car-go"
+homepage = "https://github.com/AptS-1547/car-go"
+keywords = ["cargo", "golang", "cli", "output", "wrapper"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.6.2", features = ["derive"] }
+colored = "3.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# 单文件小工具：极限压缩二进制体积 + 全量优化
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

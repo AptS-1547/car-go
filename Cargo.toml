@@ -17,6 +17,30 @@ colored = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 
+# cargo-binstall：release 资产是裸二进制（无压缩包），用 bin 格式直接下载。
+# 资产命名是 car-go-v{version}-{os}-{arch}（amd64/arm64），和 rust target triple
+# 对不上，所以 6 个平台全部用 override 写死；未列出的目标会回退到源码编译。
+[package.metadata.binstall]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-linux-amd64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-linux-arm64"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-macos-amd64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-macos-arm64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-windows-amd64.exe"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-windows-aarch64.exe"
+
 # 单文件小工具：极限压缩二进制体积 + 全量优化
 [profile.release]
 lto = true
